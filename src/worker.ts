@@ -1,0 +1,169 @@
+/**
+ * Media Worker — standalone BullMQ consumer for media-events queue.
+ *
+ * Phase C extraction. Handles media processing: image variant generation,
+ * asset deletion, CDN invalidation, temp file cleanup via Cloudinary API.
+ */
+
+import { Worker, Job } from 'bullmq';
+import { bullmqRedis } from './config/redis';
+import { createServiceLogger } from './config/logger';
+
+const logger = createServiceLogger('media-worker');
+
+export const QUEUE_NAME = 'media-events';
+
+export interface MediaEvent {
+  eventId: string;
+  eventType: string;
+  payload: {
+    publicId?: string;
+    url?: string;
+    resourceType?: string;
+    variants?: Array<{ width: number; height: number; crop?: string; suffix: string }>;
+    invalidateUrls?: string[];
+    olderThan?: string;
+    [key: string]: any;
+  };
+  createdAt: string;
+}
+
+async function getCloudinary() {
+  const cloudinary = await import('cloudinary');
+  cloudinary.v2.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+  return cloudinary.v2;
+}
+
+let _worker: Worker | null = null;
+
+export function startMediaWorker(): Worker {
+  if (_worker) return _worker;
+
+  _worker = new Worker(
+    QUEUE_NAME,
+    async (job: Job<MediaEvent>) => {
+      const event = job.data;
+
+      logger.debug('[Worker] Processing media event', {
+        type: event.eventType,
+        publicId: event.payload.publicId,
+        attempt: job.attemptsMade,
+      });
+
+      switch (event.eventType) {
+        case 'generate-variants': {
+          const cloudinary = await getCloudinary();
+          const variants = event.payload.variants || [];
+
+          for (const variant of variants) {
+            try {
+              await cloudinary.uploader.explicit(event.payload.publicId!, {
+                type: 'upload',
+                eager: [{
+                  width: variant.width,
+                  height: variant.height,
+                  crop: variant.crop || 'fill',
+                  quality: 'auto',
+                  fetch_format: 'auto',
+                }],
+              });
+              logger.debug('[Worker] Variant generated', {
+                publicId: event.payload.publicId,
+                suffix: variant.suffix,
+                size: `${variant.width}x${variant.height}`,
+              });
+            } catch (err: any) {
+              logger.error('[Worker] Variant generation failed', {
+                publicId: event.payload.publicId,
+                suffix: variant.suffix,
+                error: err.message,
+              });
+            }
+          }
+          break;
+        }
+
+        case 'delete-asset': {
+          const cloudinary = await getCloudinary();
+          try {
+            const resourceType = event.payload.resourceType || 'image';
+            await cloudinary.uploader.destroy(event.payload.publicId!, {
+              resource_type: resourceType,
+            });
+            logger.info('[Worker] Asset deleted', { publicId: event.payload.publicId });
+          } catch (err: any) {
+            logger.error('[Worker] Asset deletion failed', {
+              publicId: event.payload.publicId,
+              error: err.message,
+            });
+            throw err;
+          }
+          break;
+        }
+
+        case 'invalidate-cdn': {
+          const cloudinary = await getCloudinary();
+          const urls = event.payload.invalidateUrls || [];
+          if (urls.length > 0) {
+            try {
+              // Cloudinary CDN invalidation via URL purge
+              for (const url of urls) {
+                await cloudinary.uploader.explicit(event.payload.publicId!, {
+                  type: 'upload',
+                  invalidate: true,
+                });
+              }
+              logger.info('[Worker] CDN invalidated', { count: urls.length });
+            } catch (err: any) {
+              logger.error('[Worker] CDN invalidation failed', { error: err.message });
+            }
+          }
+          break;
+        }
+
+        case 'cleanup-temp': {
+          logger.info('[Worker] Temp cleanup triggered', {
+            olderThan: event.payload.olderThan,
+          });
+          // Future: cleanup temp uploads older than threshold
+          break;
+        }
+
+        default:
+          logger.debug('[Worker] Unhandled event type', { type: event.eventType });
+      }
+    },
+    {
+      connection: bullmqRedis,
+      concurrency: 5,
+      limiter: { max: 50, duration: 1000 }, // Cloudinary API rate limits
+    },
+  );
+
+  _worker.on('failed', (job, err) => {
+    logger.error('[Worker] Job failed', {
+      jobId: job?.id,
+      type: job?.name,
+      error: err.message,
+      attempts: job?.attemptsMade,
+    });
+  });
+
+  _worker.on('error', (err) => {
+    logger.error('[Worker] Error:', err.message);
+  });
+
+  logger.info('[Worker] Started — queue: ' + QUEUE_NAME);
+  return _worker;
+}
+
+export async function stopWorker(): Promise<void> {
+  if (_worker) {
+    await _worker.close();
+    _worker = null;
+  }
+}

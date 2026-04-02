@@ -1,0 +1,27 @@
+{
+  "name": "rez-media-events",
+  "version": "1.0.0",
+  "description": "REZ Media Events Service",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "bullmq": "^5.0.0",
+    "ioredis": "^5.3.0",
+    "mongoose": "^7.0.0",
+    "winston": "^3.11.0",
+    "dotenv": "^16.3.0",
+    "cloudinary": "^1.41.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
