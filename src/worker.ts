@@ -3,11 +3,18 @@
  *
  * Phase C extraction. Handles media processing: image variant generation,
  * asset deletion, CDN invalidation, temp file cleanup via Cloudinary API.
+ *
+ * Sprint 3: Added image.uploaded pipeline — downloads from Cloudinary,
+ * resizes via sharp to thumbnail/medium/large, re-uploads with suffixes,
+ * updates MongoDB document, and emits image.processed notification event.
  */
 
-import { Worker, Job } from 'bullmq';
+import { Worker, Job, Queue } from 'bullmq';
 import { bullmqRedis } from './config/redis';
 import { createServiceLogger } from './config/logger';
+import mongoose from 'mongoose';
+import axios from 'axios';
+import sharp from 'sharp';
 
 const logger = createServiceLogger('media-worker');
 
@@ -23,9 +30,98 @@ export interface MediaEvent {
     variants?: Array<{ width: number; height: number; crop?: string; suffix: string }>;
     invalidateUrls?: string[];
     olderThan?: string;
+    // image.uploaded fields
+    imageUrl?: string;
+    entityType?: 'product' | 'store' | 'user';
+    entityId?: string;
+    sizes?: string[];
     [key: string]: any;
   };
   createdAt: string;
+}
+
+// ── Image size definitions for the optimization pipeline ─────────────────────
+const IMAGE_SIZES: Record<string, { width: number; height: number }> = {
+  thumbnail: { width: 150, height: 150 },
+  medium:    { width: 400, height: 400 },
+  large:     { width: 800, height: 800 },
+};
+
+// Notification queue for emitting image.processed events
+const notificationQueue = new Queue('notification-events', { connection: bullmqRedis });
+
+/**
+ * Download an image from a URL and return it as a Buffer.
+ */
+async function downloadImage(url: string): Promise<Buffer> {
+  const response = await axios.get<ArrayBuffer>(url, { responseType: 'arraybuffer', timeout: 30_000 });
+  return Buffer.from(response.data);
+}
+
+/**
+ * Resize an image buffer to the target dimensions using sharp (cover crop).
+ */
+async function resizeImage(buffer: Buffer, width: number, height: number): Promise<Buffer> {
+  return sharp(buffer)
+    .resize(width, height, { fit: 'cover', position: 'centre' })
+    .jpeg({ quality: 85, progressive: true })
+    .toBuffer();
+}
+
+/**
+ * Upload a buffer to Cloudinary, appending a suffix to the original publicId.
+ * Returns the secure URL of the uploaded asset.
+ */
+async function uploadResizedToCloudinary(
+  cloudinary: ReturnType<typeof import('cloudinary')['v2']['config']> extends void ? any : any,
+  buffer: Buffer,
+  publicId: string,
+  suffix: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const targetPublicId = `${publicId}_${suffix}`;
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        public_id: targetPublicId,
+        overwrite: true,
+        resource_type: 'image',
+        format: 'jpg',
+      },
+      (err: any, result: any) => {
+        if (err) return reject(err);
+        resolve(result.secure_url as string);
+      },
+    );
+    stream.end(buffer);
+  });
+}
+
+/**
+ * Get the MongoDB collection name for a given entity type.
+ */
+function collectionForEntity(entityType: 'product' | 'store' | 'user'): string {
+  const map: Record<string, string> = { product: 'products', store: 'stores', user: 'users' };
+  return map[entityType];
+}
+
+/**
+ * Update the MongoDB document with the new variant URLs.
+ * Stores image URLs under: images.thumbnail, images.medium, images.large
+ */
+async function updateEntityImages(
+  entityType: 'product' | 'store' | 'user',
+  entityId: string,
+  variantUrls: Record<string, string>,
+): Promise<void> {
+  const collection = mongoose.connection.collection(collectionForEntity(entityType));
+  const setFields: Record<string, string> = {};
+  for (const [size, url] of Object.entries(variantUrls)) {
+    setFields[`images.${size}`] = url;
+  }
+  await collection.updateOne(
+    { _id: new mongoose.Types.ObjectId(entityId) },
+    { $set: setFields },
+  );
 }
 
 async function getCloudinary() {
@@ -55,6 +151,77 @@ export function startMediaWorker(): Worker {
       });
 
       switch (event.eventType) {
+        case 'image.uploaded': {
+          const { imageUrl, entityType, entityId, sizes } = event.payload;
+
+          if (!imageUrl || !entityType || !entityId) {
+            logger.warn('[Worker] image.uploaded missing required fields', {
+              imageUrl, entityType, entityId,
+            });
+            break;
+          }
+
+          const requestedSizes = (sizes && sizes.length > 0)
+            ? sizes
+            : ['thumbnail', 'medium', 'large'];
+
+          const cloudinary = await getCloudinary();
+
+          // Derive a Cloudinary publicId from the URL or use entityType+entityId as fallback
+          const urlSegments = imageUrl.split('/');
+          const filenameWithExt = urlSegments[urlSegments.length - 1] ?? '';
+          const basePublicId = filenameWithExt.replace(/\.[^.]+$/, '') || `${entityType}_${entityId}`;
+
+          logger.info('[Worker] image.uploaded — starting optimization pipeline', {
+            entityType, entityId, sizes: requestedSizes,
+          });
+
+          // Download original once
+          const originalBuffer = await downloadImage(imageUrl);
+
+          const variantUrls: Record<string, string> = {};
+
+          for (const sizeName of requestedSizes) {
+            const sizeConfig = IMAGE_SIZES[sizeName];
+            if (!sizeConfig) {
+              logger.warn('[Worker] Unknown size requested, skipping', { sizeName });
+              continue;
+            }
+            try {
+              const resized = await resizeImage(originalBuffer, sizeConfig.width, sizeConfig.height);
+              const uploadedUrl = await uploadResizedToCloudinary(cloudinary, resized, basePublicId, sizeName);
+              variantUrls[sizeName] = uploadedUrl;
+              logger.debug('[Worker] Variant uploaded', { sizeName, url: uploadedUrl });
+            } catch (err: any) {
+              logger.error('[Worker] Failed to process variant', {
+                sizeName, entityId, error: err.message,
+              });
+            }
+          }
+
+          // Update MongoDB document with new image URLs
+          if (Object.keys(variantUrls).length > 0) {
+            try {
+              await updateEntityImages(entityType as 'product' | 'store' | 'user', entityId, variantUrls);
+              logger.info('[Worker] MongoDB document updated with variant URLs', { entityId, entityType });
+            } catch (err: any) {
+              logger.error('[Worker] MongoDB update failed', { entityId, error: err.message });
+            }
+          }
+
+          // Emit image.processed notification event
+          await notificationQueue.add('image.processed', {
+            eventType: 'image.processed',
+            entityType,
+            entityId,
+            variantUrls,
+            processedAt: new Date().toISOString(),
+          });
+
+          logger.info('[Worker] image.uploaded pipeline complete', { entityId, entityType });
+          break;
+        }
+
         case 'generate-variants': {
           const cloudinary = await getCloudinary();
           const variants = event.payload.variants || [];
