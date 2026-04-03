@@ -13,19 +13,22 @@ import { connectMongoDB, disconnectMongoDB } from './config/mongodb';
 import { bullmqRedis } from './config/redis';
 import { startHealthServer } from './health';
 import { startMediaWorker, stopWorker } from './worker';
+import { startHttpServer } from './http';
 
 async function main(): Promise<void> {
   logger.info('[rez-media-events] Starting...');
 
   await connectMongoDB();
   const worker = startMediaWorker();
-  const healthPort = parseInt(process.env.PORT || '3008', 10);
-  const healthServer = startHealthServer(healthPort);
+  const httpPort = parseInt(process.env.PORT || '3006', 10);
+  const httpServer = startHttpServer(httpPort);
+  const healthServer = startHealthServer(httpPort + 1);
 
   const shutdown = async (signal: string) => {
     logger.info(`[${signal}] Graceful shutdown initiated`);
     try {
       await stopWorker();
+      httpServer.close();
       healthServer.close();
       await bullmqRedis.quit();
       await disconnectMongoDB();
