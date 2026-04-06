@@ -42,6 +42,9 @@ async function main(): Promise<void> {
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('unhandledRejection', (reason: unknown) => {
+    logger.error('Unhandled promise rejection', { reason: reason instanceof Error ? reason.message : String(reason) });
+  });
 
   logger.info('[rez-media-events] Ready');
 }
