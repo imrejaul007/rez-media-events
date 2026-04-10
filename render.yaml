@@ -1,0 +1,29 @@
+services:
+  - type: worker
+    name: rez-media-events
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: node dist/index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HEALTH_PORT
+        value: '3001'
+      - key: MONGODB_URI
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      # Cloudinary — required for image processing. Service starts but image
+      # uploads fail silently if these are missing.
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      # INTERNAL_SERVICE_TOKENS_JSON — used by http.ts for internal auth.
+      - key: INTERNAL_SERVICE_TOKENS_JSON
+        sync: false
+      - key: SENTRY_DSN
+        sync: false
