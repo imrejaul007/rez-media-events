@@ -109,8 +109,8 @@ const app = express();
 
 app.use(express.json());
 
-// Serve uploaded files as static assets
-app.use('/uploads', express.static(UPLOADS_DIR));
+// Serve uploaded files — protected by internal token so only trusted services can fetch them.
+app.use('/uploads', requireInternalToken, express.static(UPLOADS_DIR));
 
 // GET /health
 app.get('/health', (_req: Request, res: Response) => {
