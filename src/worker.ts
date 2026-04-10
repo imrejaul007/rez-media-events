@@ -216,6 +216,10 @@ export function startMediaWorker(): Worker {
             entityId,
             variantUrls,
             processedAt: new Date().toISOString(),
+          }, {
+            jobId: `img.processed:${entityId}`,
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 2000 },
           });
 
           logger.info('[Worker] image.uploaded pipeline complete', { entityId, entityType });
