@@ -11,8 +11,48 @@ import multer, { FileFilterCallback } from 'multer';
 import path from 'path';
 import fs from 'fs';
 import http from 'http';
+import crypto from 'crypto';
 import mongoose from 'mongoose';
 import { logger } from './config/logger';
+
+// ── Internal token middleware (mirrors rez-catalog-service pattern) ───────────
+function resolveScopedTokens(): Record<string, string> | null {
+  try {
+    const raw = process.env.INTERNAL_SERVICE_TOKENS_JSON;
+    const parsed = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+    return Object.keys(parsed).length > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function requireInternalToken(req: Request, res: Response, next: NextFunction): void {
+  const token = req.headers['x-internal-token'] as string | undefined;
+  const callerService = req.headers['x-internal-service'] as string | undefined;
+  const scopedTokens = resolveScopedTokens();
+
+  if (!scopedTokens) {
+    res.status(503).json({ success: false, error: 'Internal auth not configured — set INTERNAL_SERVICE_TOKENS_JSON' });
+    return;
+  }
+
+  const expected = callerService ? scopedTokens[callerService] : undefined;
+  const tokenBuf = Buffer.from(token || '');
+  const expectedBuf = Buffer.from(expected || '');
+
+  const isValid =
+    !!expected &&
+    tokenBuf.length === expectedBuf.length &&
+    crypto.timingSafeEqual(tokenBuf, expectedBuf);
+
+  if (!isValid) {
+    logger.warn('[HTTP] Unauthorized upload attempt', { callerService, ip: req.ip });
+    res.status(401).json({ success: false, error: 'Invalid internal token' });
+    return;
+  }
+
+  next();
+}
 
 // ── Uploads directory ────────────────────────────────────────────────────────
 const UPLOADS_DIR = path.resolve(process.cwd(), 'uploads');
@@ -77,9 +117,10 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', service: 'rez-media-events' });
 });
 
-// POST /upload
+// POST /upload  — requires internal service token
 app.post(
   '/upload',
+  requireInternalToken,
   upload.single('file'),
   async (req: Request, res: Response): Promise<void> => {
     if (!req.file) {

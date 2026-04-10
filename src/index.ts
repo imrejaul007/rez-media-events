@@ -15,7 +15,16 @@ import { startHealthServer } from './health';
 import { startMediaWorker, stopWorker } from './worker';
 import { startHttpServer } from './http';
 
+function validateEnv(): void {
+  const cloudinaryVars = ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'];
+  const missingCloudinary = cloudinaryVars.filter((k) => !process.env[k]);
+  if (missingCloudinary.length > 0) {
+    logger.warn(`[rez-media-events] WARNING: Missing Cloudinary env vars: ${missingCloudinary.join(', ')} — image upload/processing will fail`);
+  }
+}
+
 async function main(): Promise<void> {
+  validateEnv();
   logger.info('[rez-media-events] Starting...');
 
   await connectMongoDB();
