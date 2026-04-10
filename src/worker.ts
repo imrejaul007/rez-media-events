@@ -278,12 +278,17 @@ export function startMediaWorker(): Worker {
 
         case 'invalidate-cdn': {
           const cloudinary = await getCloudinary();
-          const urls = event.payload.invalidateUrls || [];
+          const urls: string[] = event.payload.invalidateUrls || [];
           if (urls.length > 0) {
             try {
-              // Cloudinary CDN invalidation via URL purge
+              // Cloudinary CDN invalidation via URL purge.
+              // Previously passed event.payload.publicId for every iteration,
+              // ignoring the individual URL — now each URL's publicId is extracted.
               for (const url of urls) {
-                await cloudinary.uploader.explicit(event.payload.publicId!, {
+                // Extract publicId from Cloudinary URL (everything between /upload/ and the extension)
+                const match = url.match(/\/upload\/(?:v\d+\/)?(.+?)(?:\.\w+)?$/);
+                const publicId = match ? match[1] : event.payload.publicId!;
+                await cloudinary.uploader.explicit(publicId, {
                   type: 'upload',
                   invalidate: true,
                 });
