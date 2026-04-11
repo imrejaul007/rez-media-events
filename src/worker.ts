@@ -161,6 +161,11 @@ export function startMediaWorker(): Worker {
             break;
           }
 
+          if (!mongoose.isValidObjectId(entityId)) {
+            logger.warn('[Worker] image.uploaded invalid entityId', { entityId });
+            break;
+          }
+
           const requestedSizes = (sizes && sizes.length > 0)
             ? sizes
             : ['thumbnail', 'medium', 'large'];
