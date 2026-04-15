@@ -22,6 +22,7 @@ export const bullmqRedis: any = new IORedis({
   keepAlive: 10000,
   retryStrategy: (times: number) => {
     const base = Math.min(Math.pow(2, times) * 200, 15000);
+    // NOTE: Math.random() is intentional here for non-cryptographic retry jitter
     return Math.floor(base + Math.random() * 1000);
   },
   reconnectOnError: (err: Error) => {
