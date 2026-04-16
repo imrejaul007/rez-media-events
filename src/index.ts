@@ -54,11 +54,15 @@ async function main(): Promise<void> {
   process.on('unhandledRejection', (reason: unknown) => {
     logger.error('Unhandled promise rejection', { reason: reason instanceof Error ? reason.message : String(reason) });
   });
+  process.on('uncaughtException', (err: Error) => {
+    logger.error('Uncaught exception', { error: err.message, stack: err.stack });
+    process.exit(1);
+  });
 
   logger.info('[rez-media-events] Ready');
 }
 
 main().catch((err) => {
-  console.error('[FATAL] Failed to start:', err);
+  logger.error('[FATAL] Failed to start:', err);
   process.exit(1);
 });
