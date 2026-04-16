@@ -12,6 +12,7 @@ import path from 'path';
 import fs from 'fs';
 import http from 'http';
 import crypto from 'crypto';
+import mongoSanitize from 'express-mongo-sanitize';
 import mongoose from 'mongoose';
 import { logger } from './config/logger';
 
@@ -107,7 +108,8 @@ async function insertMediaUpload(doc: MediaUploadDoc): Promise<string> {
 // ── Express app ──────────────────────────────────────────────────────────────
 const app = express();
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+app.use(mongoSanitize());
 
 // Serve uploaded files — protected by internal token so only trusted services can fetch them.
 app.use('/uploads', requireInternalToken, express.static(UPLOADS_DIR));

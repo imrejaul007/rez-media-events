@@ -207,6 +207,10 @@ export function startMediaWorker(): Worker {
           // Update MongoDB document with new image URLs
           if (Object.keys(variantUrls).length > 0) {
             try {
+              const validEntityTypes = ['product', 'store', 'user'];
+              if (!validEntityTypes.includes(entityType)) {
+                throw new Error(`Invalid entity type: ${entityType}. Must be one of: ${validEntityTypes.join(', ')}`);
+              }
               await updateEntityImages(entityType as 'product' | 'store' | 'user', entityId, variantUrls);
               logger.info('[Worker] MongoDB document updated with variant URLs', { entityId, entityType });
             } catch (err: any) {
@@ -291,7 +295,8 @@ export function startMediaWorker(): Worker {
               // ignoring the individual URL — now each URL's publicId is extracted.
               for (const url of urls) {
                 // Extract publicId from Cloudinary URL (everything between /upload/ and the extension)
-                const match = url.match(/\/upload\/(?:v\d+\/)?(.+?)(?:\.\w+)?$/);
+                const baseUrl = url.split('?')[0]; // Strip query params before regex
+                const match = baseUrl.match(/\/upload\/(?:v\d+\/)?(.+?)(?:\.\w+)?$/);
                 const publicId = match ? match[1] : event.payload.publicId!;
                 await cloudinary.uploader.explicit(publicId, {
                   type: 'upload',
