@@ -327,6 +327,8 @@ export function startMediaWorker(): Worker {
       connection: bullmqRedis,
       concurrency: 5,
       limiter: { max: 50, duration: 1000 }, // Cloudinary API rate limits
+      removeOnComplete: { age: 3600 },
+      removeOnFail: { age: 86400 },
     },
   );
 
@@ -352,4 +354,5 @@ export async function stopWorker(): Promise<void> {
     await _worker.close();
     _worker = null;
   }
+  await notificationQueue.close();
 }
