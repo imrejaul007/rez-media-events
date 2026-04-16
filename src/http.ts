@@ -12,6 +12,8 @@ import path from 'path';
 import fs from 'fs';
 import http from 'http';
 import crypto from 'crypto';
+import helmet from 'helmet';
+import cors from 'cors';
 import mongoSanitize from 'express-mongo-sanitize';
 import mongoose from 'mongoose';
 import { logger } from './config/logger';
@@ -69,7 +71,7 @@ const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
   filename: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
-    const uniqueName = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}${ext}`;
+    const uniqueName = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;
     cb(null, uniqueName);
   },
 });
@@ -108,6 +110,11 @@ async function insertMediaUpload(doc: MediaUploadDoc): Promise<string> {
 // ── Express app ──────────────────────────────────────────────────────────────
 const app = express();
 
+app.use(helmet());
+app.use(cors({
+  origin: (process.env.CORS_ORIGIN || 'https://rez.money').split(',').map(s => s.trim()),
+  credentials: true,
+}));
 app.use(express.json({ limit: '1mb' }));
 app.use(mongoSanitize());
 
