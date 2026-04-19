@@ -53,7 +53,26 @@ const notificationQueue = new Queue('notification-events', { connection: bullmqR
 /**
  * Download an image from a URL and return it as a Buffer.
  */
+// BAK-MEDIA-001 FIX: SSRF prevention via URL allowlist.
+// Only HTTPS URLs from approved hosts may be downloaded. This prevents attackers
+// from tricking the service into fetching internal network resources (localhost,
+// 169.254.169.254 metadata endpoint, internal IPs, etc.).
+const ALLOWED_IMAGE_HOSTS = (process.env.ALLOWED_IMAGE_HOSTS || 'res.cloudinary.com,images.unsplash.com,api.rez.money').split(',');
+
+function isUrlAllowed(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return false;
+    return ALLOWED_IMAGE_HOSTS.includes(parsed.host);
+  } catch {
+    return false;
+  }
+}
+
 async function downloadImage(url: string): Promise<Buffer> {
+  if (!isUrlAllowed(url)) {
+    throw new Error(`SSRF block: URL host not in allowlist — ${url}`);
+  }
   const response = await axios.get<ArrayBuffer>(url, { responseType: 'arraybuffer', timeout: 30_000 });
   return Buffer.from(response.data);
 }
