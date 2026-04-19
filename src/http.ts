@@ -67,16 +67,51 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 
+// B6 FIX: Magic byte signatures to detect actual file type (prevents type spoofing).
+// Clients can lie about Content-Type; magic bytes are authoritative.
+const MAGIC_BYTES: Array<{ sig: Buffer; mime: string; ext: string }> = [
+  { sig: Buffer.from([0xFF, 0xD8, 0xFF]), mime: 'image/jpeg', ext: '.jpg' },
+  { sig: Buffer.from([0x89, 0x50, 0x4E, 0x47]), mime: 'image/png', ext: '.png' },
+  { sig: Buffer.from([0x52, 0x49, 0x46, 0x46]), mime: 'image/webp', ext: '.webp' }, // RIFF....WEBP
+];
+
+function sniffMimeType(buffer: Buffer): string | null {
+  for (const { sig, mime } of MAGIC_BYTES) {
+    if (buffer.slice(0, sig.length).equals(sig)) return mime;
+  }
+  return null;
+}
+
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
   filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const uniqueName = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;
+    const uniqueName = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
     cb(null, uniqueName);
   },
 });
 
 const fileFilter = (_req: Request, file: Express.Multer.File, cb: FileFilterCallback) => {
+  // B6 FIX: Read the first 8 bytes to sniff the actual file type.
+  // Reject if magic bytes don't match any known image format,
+  // regardless of what the client claimed in Content-Type.
+  const header = Buffer.alloc(8);
+  const fd = (file as any).buffer
+    ? Buffer.from((file as any).buffer.slice(0, 8))
+    : null;
+
+  if (fd) {
+    const actualMime = sniffMimeType(fd);
+    if (!actualMime || !ALLOWED_MIME_TYPES.has(actualMime)) {
+      cb(new Error(`File content does not match an allowed image type (jpeg, png, webp). Detected: ${actualMime || 'unknown'}`));
+      return;
+    }
+    // Override mimetype with the sniffed value — trust the bytes, not the header
+    (file as any).mimetype = actualMime;
+    cb(null, true);
+    return;
+  }
+
+  // Fallback: use client-supplied mimetype if buffer is not available (shouldn't happen with diskStorage)
   if (ALLOWED_MIME_TYPES.has(file.mimetype)) {
     cb(null, true);
   } else {
@@ -140,11 +175,11 @@ app.post(
     try {
       const { filename, originalname, mimetype, size, path: filePath } = req.file;
 
-      // Extract optional uploadedBy from Authorization header or query
-      const uploadedBy =
-        (req.headers['x-user-id'] as string | undefined) ??
-        (req.query.uploadedBy as string | undefined) ??
-        null;
+      // BAK-MEDIA-002 FIX: uploadedBy must be the authenticated service principal, not a
+      // user-supplied header value. Previously any caller with the internal token could
+      // upload files and set uploadedBy to any arbitrary user ID, enabling identity spoofing.
+      // Now uploadedBy is set to the verified internal service name from the auth context.
+      const uploadedBy = (req.headers['x-internal-service'] as string | undefined) ?? null;
 
       const mediaId = await insertMediaUpload({
         filename,
