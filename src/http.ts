@@ -164,6 +164,32 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', service: 'rez-media-events' });
 });
 
+// B7: Verify magic bytes of the saved upload BEFORE persisting metadata.
+// multer (diskStorage) has already written the file at `file.path`; read the
+// first 16 bytes synchronously and reject if they don't match an allowed
+// image signature — preventing attackers from disguising e.g. a .php payload
+// as image/jpeg via the Content-Type header.
+function verifyFileSignature(filePath: string): 'image/jpeg' | 'image/png' | 'image/webp' | null {
+  const header = Buffer.alloc(16);
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    fs.readSync(fd, header, 0, 16, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (header.length < 12) return null;
+  if (header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) return 'image/jpeg';
+  if (
+    header[0] === 0x89 && header[1] === 0x50 && header[2] === 0x4e && header[3] === 0x47 &&
+    header[4] === 0x0d && header[5] === 0x0a && header[6] === 0x1a && header[7] === 0x0a
+  ) return 'image/png';
+  if (
+    header[0] === 0x52 && header[1] === 0x49 && header[2] === 0x46 && header[3] === 0x46 &&
+    header[8] === 0x57 && header[9] === 0x45 && header[10] === 0x42 && header[11] === 0x50
+  ) return 'image/webp';
+  return null;
+}
+
 // POST /upload  — requires internal service token
 app.post(
   '/upload',
@@ -177,6 +203,20 @@ app.post(
 
     try {
       const { filename, originalname, mimetype, size, path: filePath } = req.file;
+
+      // B7: Magic-byte verification — trust bytes, not the client-supplied header.
+      const detectedMime = verifyFileSignature(filePath);
+      if (!detectedMime || detectedMime !== mimetype) {
+        try { fs.unlinkSync(filePath); } catch { /* best-effort cleanup */ }
+        logger.warn('[HTTP] Rejected upload with mismatched signature', {
+          filename, declaredMime: mimetype, detectedMime,
+        });
+        res.status(400).json({
+          success: false,
+          error: 'Invalid file signature — file contents do not match declared type',
+        });
+        return;
+      }
 
       // BAK-MEDIA-002 FIX: uploadedBy must be the authenticated service principal, not a
       // user-supplied header value. Previously any caller with the internal token could
