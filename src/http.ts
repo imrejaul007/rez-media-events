@@ -1,9 +1,16 @@
 /**
  * rez-media-events — HTTP upload server
  *
- * Sprint 10: Adds an Express HTTP server alongside the BullMQ worker.
- * Handles multipart file uploads, uploads to Cloudinary, stores metadata
- * in MongoDB. Files are served directly from Cloudinary CDN (no local storage).
+ * Handles multipart file uploads, validates MIME by magic bytes, streams the
+ * file directly to Cloudinary (no ephemeral disk), and stores metadata in
+ * MongoDB. Files are served from Cloudinary CDN.
+ *
+ * B6 (MASTER-PLAN-2026-04-19):
+ *   - multer.memoryStorage (no write to Render's ephemeral disk)
+ *   - magic-byte MIME sniff in the handler AFTER multer populates `file.buffer`
+ *     (multer's fileFilter runs BEFORE the buffer is available with memoryStorage)
+ *   - Cloudinary client centralized in src/config/cloudinary.ts
+ *   - Legacy /uploads/* route returns 410 Gone
  */
 
 import express, { Request, Response, NextFunction } from 'express';
@@ -15,6 +22,7 @@ import cors from 'cors';
 import mongoSanitize from 'express-mongo-sanitize';
 import mongoose from 'mongoose';
 import { logger } from './config/logger';
+import { uploadBufferToCloudinary } from './config/cloudinary';
 
 // ── Internal token middleware (mirrors rez-catalog-service pattern) ───────────
 function resolveScopedTokens(): Record<string, string> | null {
@@ -55,50 +63,12 @@ function requireInternalToken(req: Request, res: Response, next: NextFunction): 
   next();
 }
 
-// ── Cloudinary upload helper ─────────────────────────────────────────────────
-// B6 FIX: Upload directly from memory to Cloudinary — no ephemeral disk storage.
-// Cloudinary serves files from CDN; files survive container restarts and deploys.
-async function uploadToCloudinary(
-  buffer: Buffer,
-  mimeType: string,
-  originalName: string,
-): Promise<{ url: string; publicId: string; format: string; width: number; height: number }> {
-  const cloudinary = await import('cloudinary');
-  cloudinary.v2.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET,
-  });
-
-  return new Promise((resolve, reject) => {
-    const uploadStream = cloudinary.v2.uploader.upload_stream(
-      {
-        folder: 'rez-media/uploads',
-        resource_type: 'image',
-        format: mimeType.split('/')[1] || 'jpg',
-        original_filename: originalName,
-      },
-      (error, result) => {
-        if (error || !result) {
-          reject(error || new Error('Cloudinary upload returned no result'));
-          return;
-        }
-        resolve({
-          url: result.secure_url,
-          publicId: result.public_id,
-          format: result.format,
-          width: result.width,
-          height: result.height,
-        });
-      },
-    );
-    uploadStream.end(buffer);
-  });
-}
-
-// ── Multer memory storage + magic-byte validation ────────────────────────────
-// B6 FIX: Store file in memory only. Cloudinary receives the buffer directly
-// — no write to ephemeral disk, no subsequent read from disk.
+// ── Multer memory storage ────────────────────────────────────────────────────
+// B6: multer.memoryStorage keeps the file in RAM on req.file.buffer — no disk
+// writes. Note: with memoryStorage, file.buffer is NOT yet populated inside
+// the `fileFilter` callback; it becomes available only after multer has fully
+// consumed the multipart stream. Therefore the magic-byte sniff MUST run in
+// the handler, not in fileFilter.
 const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 
@@ -110,7 +80,9 @@ const MAGIC_BYTES: Array<{ sig: Buffer; mime: string }> = [
 
 function sniffMimeType(buffer: Buffer): string | null {
   for (const { sig, mime } of MAGIC_BYTES) {
-    if (buffer.slice(0, sig.length).equals(sig)) return mime;
+    if (buffer.length >= sig.length && buffer.slice(0, sig.length).equals(sig)) {
+      return mime;
+    }
   }
   return null;
 }
@@ -119,20 +91,12 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_FILE_SIZE },
   fileFilter: (_req: Request, file: Express.Multer.File, cb: FileFilterCallback) => {
-    const buf = Buffer.from((file as any).buffer?.slice(0, 12) ?? []);
-    if (buf.length === 0) {
-      cb(new Error('Empty file upload'));
+    // Client-declared mimetype check — cheap early reject. The real defence
+    // is the magic-byte sniff in the handler below.
+    if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
+      cb(new Error(`Unsupported file type: ${file.mimetype}. Allowed: jpeg, png, webp`));
       return;
     }
-    const actualMime = sniffMimeType(buf);
-    if (!actualMime || !ALLOWED_MIME_TYPES.has(actualMime)) {
-      cb(new Error(
-        `File content does not match an allowed image type. Detected: ${actualMime || 'unknown'}. Allowed: jpeg, png, webp`,
-      ));
-      return;
-    }
-    // Trust the bytes, not the client-supplied header
-    (file as any).mimetype = actualMime;
     cb(null, true);
   },
 });
@@ -151,8 +115,8 @@ interface MediaUploadDoc {
 }
 
 async function insertMediaUpload(doc: MediaUploadDoc): Promise<string> {
-  const collection = mongoose.connection.collection('media_uploads');
-  const result = await collection.insertOne(doc as any);
+  const collection = mongoose.connection.collection<MediaUploadDoc>('media_uploads');
+  const result = await collection.insertOne(doc);
   return result.insertedId.toString();
 }
 
@@ -175,9 +139,20 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', service: 'rez-media-events' });
 });
 
+// GET /uploads/* — legacy local-disk route, now permanently gone.
+// B6: Files are served from Cloudinary CDN. Any consumer still reading from
+// /uploads/* has a stale cached URL and should refresh from the originating
+// record (which now stores the Cloudinary secure_url).
+app.use('/uploads', requireInternalToken, (_req: Request, res: Response) => {
+  res.status(410).json({
+    success: false,
+    error: 'Legacy local-file route removed — files now live on Cloudinary. Refresh the record to get the secure_url.',
+    code: 'LEGACY_UPLOADS_GONE',
+  });
+});
+
 // POST /upload  — requires internal service token
-// B6 FIX: Upload directly from memory to Cloudinary — no ephemeral disk.
-// Magic-byte validation is in the multer fileFilter (runs before this handler).
+// Magic-byte validation runs AFTER multer has populated req.file.buffer.
 app.post(
   '/upload',
   requireInternalToken,
@@ -188,20 +163,49 @@ app.post(
       return;
     }
 
-    try {
-      const { buffer, originalname, mimetype, size } = req.file;
+    const { buffer, originalname, mimetype: declaredMime, size } = req.file;
 
-      const uploadedBy = (req.headers['x-internal-service'] as string | undefined) ?? null;
+    if (!buffer || buffer.length === 0) {
+      res.status(400).json({ success: false, error: 'Empty file upload' });
+      return;
+    }
 
-      const cloudinaryResult = await uploadToCloudinary(
-        Buffer.from(buffer ?? []),
-        mimetype,
+    // Magic-byte sniff — trust the bytes, not the client-supplied header.
+    const actualMime = sniffMimeType(buffer);
+    if (!actualMime || !ALLOWED_MIME_TYPES.has(actualMime)) {
+      logger.warn('[HTTP] Magic-byte MIME mismatch', {
+        declaredMime,
+        detected: actualMime ?? 'unknown',
         originalname,
-      );
+        size,
+      });
+      res.status(400).json({
+        success: false,
+        error: `File content does not match an allowed image type. Detected: ${actualMime ?? 'unknown'}. Allowed: jpeg, png, webp`,
+      });
+      return;
+    }
 
+    const uploadedBy = (req.headers['x-internal-service'] as string | undefined) ?? null;
+
+    let cloudinaryResult;
+    try {
+      cloudinaryResult = await uploadBufferToCloudinary(buffer, {
+        mimeType: actualMime,
+        folder: 'rez/media-events',
+        originalFilename: originalname,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error('[HTTP] Cloudinary upload failed', { error: message, originalname, size });
+      res.status(502).json({ success: false, error: 'Upload service unavailable' });
+      return;
+    }
+
+    try {
       const mediaId = await insertMediaUpload({
         originalName: originalname,
-        mimeType: mimetype,
+        mimeType: actualMime,
         size,
         cloudinaryUrl: cloudinaryResult.url,
         cloudinaryPublicId: cloudinaryResult.publicId,
@@ -225,21 +229,35 @@ app.post(
         height: cloudinaryResult.height,
         mediaId,
       });
-    } catch (err: any) {
-      logger.error('[HTTP] Upload failed', { error: err.message });
-      res.status(500).json({ success: false, error: 'Upload failed' });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error('[HTTP] Mongo insert failed after Cloudinary upload', {
+        error: message,
+        publicId: cloudinaryResult.publicId,
+      });
+      // The Cloudinary asset exists — surface the URL so the caller can still
+      // persist it and the asset isn't orphaned.
+      res.status(201).json({
+        success: true,
+        url: cloudinaryResult.url,
+        publicId: cloudinaryResult.publicId,
+        width: cloudinaryResult.width,
+        height: cloudinaryResult.height,
+        mediaId: null,
+        warning: 'Upload succeeded but metadata persistence failed',
+      });
     }
   },
 );
 
 // ── Multer error handler ─────────────────────────────────────────────────────
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-  if (err instanceof multer.MulterError || err?.message?.startsWith('Unsupported file type')) {
-    res.status(400).json({ success: false, error: err.message });
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  const message = err instanceof Error ? err.message : String(err);
+  if (err instanceof multer.MulterError || message.startsWith('Unsupported file type')) {
+    res.status(400).json({ success: false, error: message });
     return;
   }
-  logger.error('[HTTP] Unhandled error', { error: err.message });
+  logger.error('[HTTP] Unhandled error', { error: message });
   res.status(500).json({ success: false, error: 'Internal server error' });
 });
 
