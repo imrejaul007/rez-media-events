@@ -144,6 +144,9 @@ async function insertMediaUpload(doc: MediaUploadDoc): Promise<string> {
 
 // ── Express app ──────────────────────────────────────────────────────────────
 const app = express();
+// Behind Render LB + CF — trust N hops so per-IP rate limiters key on real client IP.
+// See MASTER-PLAN-2026-04-19 P1 (trust proxy fleet-wide).
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS) || 1);
 
 app.use(helmet());
 app.use(cors({
