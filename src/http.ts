@@ -2,14 +2,12 @@
  * rez-media-events — HTTP upload server
  *
  * Sprint 10: Adds an Express HTTP server alongside the BullMQ worker.
- * Handles multipart file uploads, stores metadata in MongoDB, and
- * serves uploaded files as static assets.
+ * Handles multipart file uploads, uploads to Cloudinary, stores metadata
+ * in MongoDB. Files are served directly from Cloudinary CDN (no local storage).
  */
 
 import express, { Request, Response, NextFunction } from 'express';
 import multer, { FileFilterCallback } from 'multer';
-import path from 'path';
-import fs from 'fs';
 import http from 'http';
 import crypto from 'crypto';
 import helmet from 'helmet';
@@ -57,22 +55,57 @@ function requireInternalToken(req: Request, res: Response, next: NextFunction): 
   next();
 }
 
-// ── Uploads directory ────────────────────────────────────────────────────────
-const UPLOADS_DIR = path.resolve(process.cwd(), 'uploads');
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+// ── Cloudinary upload helper ─────────────────────────────────────────────────
+// B6 FIX: Upload directly from memory to Cloudinary — no ephemeral disk storage.
+// Cloudinary serves files from CDN; files survive container restarts and deploys.
+async function uploadToCloudinary(
+  buffer: Buffer,
+  mimeType: string,
+  originalName: string,
+): Promise<{ url: string; publicId: string; format: string; width: number; height: number }> {
+  const cloudinary = await import('cloudinary');
+  cloudinary.v2.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.v2.uploader.upload_stream(
+      {
+        folder: 'rez-media/uploads',
+        resource_type: 'image',
+        format: mimeType.split('/')[1] || 'jpg',
+        original_filename: originalName,
+      },
+      (error, result) => {
+        if (error || !result) {
+          reject(error || new Error('Cloudinary upload returned no result'));
+          return;
+        }
+        resolve({
+          url: result.secure_url,
+          publicId: result.public_id,
+          format: result.format,
+          width: result.width,
+          height: result.height,
+        });
+      },
+    );
+    uploadStream.end(buffer);
+  });
 }
 
-// ── Multer storage and validation ────────────────────────────────────────────
+// ── Multer memory storage + magic-byte validation ────────────────────────────
+// B6 FIX: Store file in memory only. Cloudinary receives the buffer directly
+// — no write to ephemeral disk, no subsequent read from disk.
 const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 
-// B6 FIX: Magic byte signatures to detect actual file type (prevents type spoofing).
-// Clients can lie about Content-Type; magic bytes are authoritative.
-const MAGIC_BYTES: Array<{ sig: Buffer; mime: string; ext: string }> = [
-  { sig: Buffer.from([0xFF, 0xD8, 0xFF]), mime: 'image/jpeg', ext: '.jpg' },
-  { sig: Buffer.from([0x89, 0x50, 0x4E, 0x47]), mime: 'image/png', ext: '.png' },
-  { sig: Buffer.from([0x52, 0x49, 0x46, 0x46]), mime: 'image/webp', ext: '.webp' }, // RIFF....WEBP
+const MAGIC_BYTES: Array<{ sig: Buffer; mime: string }> = [
+  { sig: Buffer.from([0xFF, 0xD8, 0xFF]), mime: 'image/jpeg' },
+  { sig: Buffer.from([0x89, 0x50, 0x4E, 0x47]), mime: 'image/png' },
+  { sig: Buffer.from([0x52, 0x49, 0x46, 0x46]), mime: 'image/webp' }, // RIFF....WEBP
 ];
 
 function sniffMimeType(buffer: Buffer): string | null {
@@ -82,63 +115,44 @@ function sniffMimeType(buffer: Buffer): string | null {
   return null;
 }
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
-  filename: (_req, file, cb) => {
-    const uniqueName = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-    cb(null, uniqueName);
-  },
-});
-
-const fileFilter = (_req: Request, file: Express.Multer.File, cb: FileFilterCallback) => {
-  // B6 FIX: Read the first 8 bytes to sniff the actual file type.
-  // Reject if magic bytes don't match any known image format,
-  // regardless of what the client claimed in Content-Type.
-  const header = Buffer.alloc(8);
-  const fd = (file as any).buffer
-    ? Buffer.from((file as any).buffer.slice(0, 8))
-    : null;
-
-  if (fd) {
-    const actualMime = sniffMimeType(fd);
-    if (!actualMime || !ALLOWED_MIME_TYPES.has(actualMime)) {
-      cb(new Error(`File content does not match an allowed image type (jpeg, png, webp). Detected: ${actualMime || 'unknown'}`));
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_FILE_SIZE },
+  fileFilter: (_req: Request, file: Express.Multer.File, cb: FileFilterCallback) => {
+    const buf = Buffer.from((file as any).buffer?.slice(0, 12) ?? []);
+    if (buf.length === 0) {
+      cb(new Error('Empty file upload'));
       return;
     }
-    // Override mimetype with the sniffed value — trust the bytes, not the header
+    const actualMime = sniffMimeType(buf);
+    if (!actualMime || !ALLOWED_MIME_TYPES.has(actualMime)) {
+      cb(new Error(
+        `File content does not match an allowed image type. Detected: ${actualMime || 'unknown'}. Allowed: jpeg, png, webp`,
+      ));
+      return;
+    }
+    // Trust the bytes, not the client-supplied header
     (file as any).mimetype = actualMime;
     cb(null, true);
-    return;
-  }
-
-  // Fallback: use client-supplied mimetype if buffer is not available (shouldn't happen with diskStorage)
-  if (ALLOWED_MIME_TYPES.has(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(new Error(`Unsupported file type: ${file.mimetype}. Allowed: jpeg, png, webp`));
-  }
-};
-
-const upload = multer({
-  storage,
-  limits: { fileSize: MAX_FILE_SIZE },
-  fileFilter,
+  },
 });
 
 // ── MongoDB media_uploads collection helper ──────────────────────────────────
 interface MediaUploadDoc {
-  filename: string;
   originalName: string;
   mimeType: string;
   size: number;
-  path: string;
+  cloudinaryUrl: string;
+  cloudinaryPublicId: string;
+  width: number;
+  height: number;
   uploadedBy: string | null;
   createdAt: Date;
 }
 
 async function insertMediaUpload(doc: MediaUploadDoc): Promise<string> {
   const collection = mongoose.connection.collection('media_uploads');
-  const result = await collection.insertOne(doc);
+  const result = await collection.insertOne(doc as any);
   return result.insertedId.toString();
 }
 
@@ -156,41 +170,14 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 app.use(mongoSanitize());
 
-// Serve uploaded files — protected by internal token so only trusted services can fetch them.
-app.use('/uploads', requireInternalToken, express.static(UPLOADS_DIR));
-
 // GET /health
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', service: 'rez-media-events' });
 });
 
-// B7: Verify magic bytes of the saved upload BEFORE persisting metadata.
-// multer (diskStorage) has already written the file at `file.path`; read the
-// first 16 bytes synchronously and reject if they don't match an allowed
-// image signature — preventing attackers from disguising e.g. a .php payload
-// as image/jpeg via the Content-Type header.
-function verifyFileSignature(filePath: string): 'image/jpeg' | 'image/png' | 'image/webp' | null {
-  const header = Buffer.alloc(16);
-  const fd = fs.openSync(filePath, 'r');
-  try {
-    fs.readSync(fd, header, 0, 16, 0);
-  } finally {
-    fs.closeSync(fd);
-  }
-  if (header.length < 12) return null;
-  if (header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) return 'image/jpeg';
-  if (
-    header[0] === 0x89 && header[1] === 0x50 && header[2] === 0x4e && header[3] === 0x47 &&
-    header[4] === 0x0d && header[5] === 0x0a && header[6] === 0x1a && header[7] === 0x0a
-  ) return 'image/png';
-  if (
-    header[0] === 0x52 && header[1] === 0x49 && header[2] === 0x46 && header[3] === 0x46 &&
-    header[8] === 0x57 && header[9] === 0x45 && header[10] === 0x42 && header[11] === 0x50
-  ) return 'image/webp';
-  return null;
-}
-
 // POST /upload  — requires internal service token
+// B6 FIX: Upload directly from memory to Cloudinary — no ephemeral disk.
+// Magic-byte validation is in the multer fileFilter (runs before this handler).
 app.post(
   '/upload',
   requireInternalToken,
@@ -202,43 +189,40 @@ app.post(
     }
 
     try {
-      const { filename, originalname, mimetype, size, path: filePath } = req.file;
+      const { buffer, originalname, mimetype, size } = req.file;
 
-      // B7: Magic-byte verification — trust bytes, not the client-supplied header.
-      const detectedMime = verifyFileSignature(filePath);
-      if (!detectedMime || detectedMime !== mimetype) {
-        try { fs.unlinkSync(filePath); } catch { /* best-effort cleanup */ }
-        logger.warn('[HTTP] Rejected upload with mismatched signature', {
-          filename, declaredMime: mimetype, detectedMime,
-        });
-        res.status(400).json({
-          success: false,
-          error: 'Invalid file signature — file contents do not match declared type',
-        });
-        return;
-      }
-
-      // BAK-MEDIA-002 FIX: uploadedBy must be the authenticated service principal, not a
-      // user-supplied header value. Previously any caller with the internal token could
-      // upload files and set uploadedBy to any arbitrary user ID, enabling identity spoofing.
-      // Now uploadedBy is set to the verified internal service name from the auth context.
       const uploadedBy = (req.headers['x-internal-service'] as string | undefined) ?? null;
 
+      const cloudinaryResult = await uploadToCloudinary(
+        Buffer.from(buffer ?? []),
+        mimetype,
+        originalname,
+      );
+
       const mediaId = await insertMediaUpload({
-        filename,
         originalName: originalname,
         mimeType: mimetype,
         size,
-        path: filePath,
+        cloudinaryUrl: cloudinaryResult.url,
+        cloudinaryPublicId: cloudinaryResult.publicId,
+        width: cloudinaryResult.width,
+        height: cloudinaryResult.height,
         uploadedBy,
         createdAt: new Date(),
       });
 
-      logger.info('[HTTP] File uploaded', { filename, mimetype, size, mediaId });
+      logger.info('[HTTP] File uploaded', {
+        mediaId,
+        cloudinaryUrl: cloudinaryResult.url,
+        size,
+      });
 
       res.status(201).json({
         success: true,
-        url: `/uploads/${filename}`,
+        url: cloudinaryResult.url,
+        publicId: cloudinaryResult.publicId,
+        width: cloudinaryResult.width,
+        height: cloudinaryResult.height,
         mediaId,
       });
     } catch (err: any) {
