@@ -19,7 +19,9 @@ function validateEnv(): void {
   const cloudinaryVars = ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'];
   const missingCloudinary = cloudinaryVars.filter((k) => !process.env[k]);
   if (missingCloudinary.length > 0) {
-    logger.warn(`[rez-media-events] WARNING: Missing Cloudinary env vars: ${missingCloudinary.join(', ')} — image upload/processing will fail`);
+    // MED-SEC-FIX: Downgrade from warn to error — Cloudinary is required for the
+    // upload endpoint to function. A missing env var should not silently degrade.
+    logger.error(`[rez-media-events] FATAL: Missing Cloudinary env vars: ${missingCloudinary.join(', ')} — upload endpoint will fail`);
   }
 }
 

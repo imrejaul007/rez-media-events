@@ -1,5 +1,6 @@
 import IORedis from 'ioredis';
 import { logger } from './logger';
+import { randomInt } from 'crypto';
 
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 
@@ -13,7 +14,7 @@ function parsedUrl() {
 
 const u = parsedUrl();
 
-export const bullmqRedis: any = new IORedis({
+export const bullmqRedis: IORedis = new IORedis({
   host: u.hostname || 'localhost',
   port: parseInt(u.port || '6379', 10),
   password: u.password || undefined,
@@ -22,14 +23,13 @@ export const bullmqRedis: any = new IORedis({
   keepAlive: 10000,
   retryStrategy: (times: number) => {
     const base = Math.min(Math.pow(2, times) * 200, 15000);
-    // NOTE: Math.random() is intentional here for non-cryptographic retry jitter
-    return Math.floor(base + Math.random() * 1000);
+    return base + randomInt(0, 1000);
   },
   reconnectOnError: (err: Error) => {
     return err.message.includes('ECONNRESET') || err.message.includes('EPIPE') || err.message.includes('READONLY');
   },
   lazyConnect: false,
-  tls: process.env.REDIS_TLS === 'true' ? {} : undefined,
+  tls: process.env.REDIS_TLS === 'true' ? { rejectUnauthorized: true } : undefined,
 });
 
 bullmqRedis.on('connect', () => logger.info('[Redis] Connection established'));
