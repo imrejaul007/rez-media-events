@@ -46,7 +46,15 @@ function requireInternalToken(req: Request, res: Response, next: NextFunction): 
   }
 
   const expected = callerService ? scopedTokens[callerService] : undefined;
-  const tokenBuf = Buffer.from(token || '');
+  // MED-SEC-FIX: Reject blank tokens before timing comparison.
+  // A blank token padded to the expected length matches timingSafeEqual, bypassing auth.
+  const tokenStr = token || '';
+  if (tokenStr.trim().length === 0) {
+    logger.warn('[HTTP] Unauthorized upload attempt — blank token', { callerService, ip: req.ip });
+    res.status(401).json({ success: false, error: 'Invalid internal token' });
+    return;
+  }
+  const tokenBuf = Buffer.from(tokenStr);
   const expectedBuf = Buffer.from(expected || '');
 
   const isValid =
