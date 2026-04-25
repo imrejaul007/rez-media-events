@@ -21,8 +21,12 @@ import helmet from 'helmet';
 import cors from 'cors';
 import mongoSanitize from 'express-mongo-sanitize';
 import mongoose from 'mongoose';
+import client from 'prom-client';
 import { logger } from './config/logger';
 import { uploadBufferToCloudinary } from './config/cloudinary';
+
+const register = new client.Registry();
+client.collectDefaultMetrics({ register });
 
 // ── Internal token middleware (mirrors rez-catalog-service pattern) ───────────
 function resolveScopedTokens(): Record<string, string> | null {
@@ -145,6 +149,12 @@ app.use(mongoSanitize());
 // GET /health
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', service: 'rez-media-events' });
+});
+
+// GET /metrics
+app.get('/metrics', async (_req: Request, res: Response) => {
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
 });
 
 // GET /uploads/* — legacy local-disk route, now permanently gone.
