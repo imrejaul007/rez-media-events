@@ -18,9 +18,9 @@
     "@types/multer": "^1.4.13",
     "@types/node": "^20.0.0",
     "@types/sharp": "^0.31.0",
-    "axios": "^1.7.0",
+    "axios": "^1.15.0",
+    "cloudinary": "^2.10.0",
     "bullmq": "^5.0.0",
-    "cloudinary": "^1.41.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.0",
     "express": "^4.22.1",
@@ -32,6 +32,10 @@
     "sharp": "^0.33.0",
     "typescript": "^5.4.5",
     "winston": "^3.11.0"
+  },
+  "overrides": {
+    "follow-redirects": ">=1.15.12",
+    "uuid": ">=14.0.0"
   },
   "engines": {
     "node": "20.x"
