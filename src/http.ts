@@ -90,6 +90,12 @@ const MAGIC_BYTES: Array<{ sig: Buffer; mime: string }> = [
   { sig: Buffer.from([0x52, 0x49, 0x46, 0x46]), mime: 'image/webp' }, // RIFF....WEBP
 ];
 
+/**
+ * Detects the MIME type of an image by reading magic bytes (file signatures).
+ * Checks for JPEG (FF D8 FF), PNG (89 50 4E 47), and WebP (52 49 46 46) signatures.
+ * @param buffer - The first bytes of the file
+ * @returns The detected MIME type or null if the signature is unrecognized
+ */
 function sniffMimeType(buffer: Buffer): string | null {
   for (const { sig, mime } of MAGIC_BYTES) {
     if (buffer.length >= sig.length && buffer.slice(0, sig.length).equals(sig)) {
@@ -280,6 +286,12 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 // ── Server factory ───────────────────────────────────────────────────────────
+/**
+ * Creates and starts the HTTP server for the media upload service.
+ * Mounts Express with upload, health check, and Prometheus metrics endpoints.
+ * @param port - The port number to listen on
+ * @returns The HTTP server instance
+ */
 export function startHttpServer(port: number): http.Server {
   const server = http.createServer(app);
   server.listen(port, () => {
