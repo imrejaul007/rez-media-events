@@ -69,6 +69,13 @@ function isUrlAllowed(url: string): boolean {
   }
 }
 
+/**
+ * Downloads an image from a URL with SSRF protection via host allowlist.
+ * Rejects any URL whose host is not in the configured INTERNAL_ASSETS_ALLOWED_HOSTS list.
+ * @param url - The image URL to download
+ * @returns The raw image buffer
+ * @throws Error if the URL is not in the SSRF allowlist
+ */
 async function downloadImage(url: string): Promise<Buffer> {
   if (!isUrlAllowed(url)) {
     throw new Error(`SSRF block: URL host not in allowlist — ${url}`);
@@ -80,6 +87,13 @@ async function downloadImage(url: string): Promise<Buffer> {
 /**
  * Resize an image buffer to the target dimensions using sharp (cover crop).
  */
+/**
+ * Resizes an image buffer to the target dimensions using sharp (cover crop).
+ * @param buffer - The raw image buffer
+ * @param width - Target width in pixels
+ * @param height - Target height in pixels
+ * @returns The resized image buffer as JPEG
+ */
 async function resizeImage(buffer: Buffer, width: number, height: number): Promise<Buffer> {
   return sharp(buffer)
     .resize(width, height, { fit: 'cover', position: 'centre' })
@@ -90,6 +104,13 @@ async function resizeImage(buffer: Buffer, width: number, height: number): Promi
 /**
  * Upload a buffer to Cloudinary, appending a suffix to the original publicId.
  * Returns the secure URL of the uploaded asset.
+ */
+/**
+ * Uploads a resized image buffer to Cloudinary under the specified folder.
+ * @param buffer - The resized image buffer
+ * @param folder - The Cloudinary folder path
+ * @param publicId - Optional custom public ID
+ * @returns Cloudinary upload result with URL and dimensions
  */
 async function uploadResizedToCloudinary(
   cloudinary: ReturnType<typeof import('cloudinary')['v2']['config']> extends void ? any : any,
@@ -127,6 +148,13 @@ function collectionForEntity(entityType: 'product' | 'store' | 'user'): string {
  * Update the MongoDB document with the new variant URLs.
  * Stores image URLs under: images.thumbnail, images.medium, images.large
  */
+/**
+ * Updates the image URLs on an entity (product/store/category) in MongoDB.
+ * @param entityType - The entity type (product, store, category)
+ * @param entityId - The entity ID
+ * @param resizedUrl - The Cloudinary URL of the resized image
+ * @param resizedPublicId - The Cloudinary public ID of the resized image
+ */
 async function updateEntityImages(
   entityType: 'product' | 'store' | 'user',
   entityId: string,
@@ -155,6 +183,11 @@ async function getCloudinary() {
 
 let _worker: Worker | null = null;
 
+/**
+ * Starts the BullMQ media worker on the 'media-processing' queue.
+ * Handles resize and upload events for product and store images.
+ * @returns The BullMQ worker instance (singleton)
+ */
 export function startMediaWorker(): Worker {
   if (_worker) return _worker;
 
